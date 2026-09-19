@@ -1,22 +1,27 @@
 name: Daily Paper Tracker
 
 on:
-  # push:
-  #   branches:
-  #     - master
   # schedule:
-  #   - cron: "58 0 * * *"
+  #   - cron: "0 1 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   run-tracker:
+    if: ${{ github.ref_type == 'branch' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          # Queued runs must start with the current branch history.
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,8 +29,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Dependencies
-        run: |
-          pip install requests openai
+        run: pip install requests openai
 
       - name: Run Script
         env:
@@ -35,11 +39,78 @@ jobs:
         run: python3 -u paper_tracker.py
 
       - name: Commit and push history
-        if: ${{ success() }}
+        id: save_history
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          mkdir -p config
-          touch config/seen_papers.txt
-          git add config/seen_papers.txt
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update seen papers history" && git push)
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import time
+
+          root = Path.cwd()
+          branch = os.environ["TARGET_BRANCH"]
+          history_path = Path("config/seen_papers.txt")
+
+          def git(*args, cwd=root, check=True):
+              return subprocess.run(["git", *map(str, args)], cwd=cwd, check=check)
+
+          def read_ids(path):
+              if not path.exists():
+                  return []
+              return [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines()
+                      if line.strip()]
+
+          def save_history():
+              # Preserve this run's history while working on fresh remote commits.
+              local_ids = read_ids(root / history_path)
+              if not local_ids:
+                  print("No history to save.", flush=True)
+                  return
+
+              for attempt in range(1, 4):
+                  print(f"Saving paper history, attempt {attempt}/3", flush=True)
+                  git("fetch", "--no-tags", "origin", f"refs/heads/{branch}")
+                  with tempfile.TemporaryDirectory(prefix="daily-history-", dir=os.environ["RUNNER_TEMP"]) as temp:
+                      tree = Path(temp) / "repo"
+                      git("worktree", "add", "--detach", tree, "FETCH_HEAD")
+                      try:
+                          target = tree / history_path
+                          merged = list(dict.fromkeys(read_ids(target) + local_ids))
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          target.write_text("\n".join(merged) + "\n", encoding="utf-8", newline="\n")
+                          git("add", "--", history_path, cwd=tree)
+                          diff = git("diff", "--cached", "--quiet", "--", history_path, cwd=tree, check=False)
+                          if diff.returncode == 0:
+                              print("Remote history already contains these papers.", flush=True)
+                              return
+                          if diff.returncode != 1:
+                              raise RuntimeError("Could not compare paper history.")
+                          git("-c", "user.name=github-actions[bot]",
+                              "-c", "user.email=github-actions[bot]@users.noreply.github.com",
+                              "commit", "-m", "Auto-update seen papers history", cwd=tree)
+                          result = git("push", "origin", f"HEAD:refs/heads/{branch}", cwd=tree, check=False)
+                          if result.returncode == 0:
+                              print("Paper history saved successfully.", flush=True)
+                              return
+                      finally:
+                          # Only remove the temporary worktree created above.
+                          git("worktree", "remove", tree, check=False)
+                  if attempt < 3:
+                      time.sleep(3)
+
+              raise RuntimeError("Could not save history after 3 attempts; download the history artifact.")
+
+          save_history()
+          PY
+
+      - name: Preserve history if saving fails
+        if: ${{ failure() && steps.save_history.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: seen-papers-${{ github.run_id }}-${{ github.run_attempt }}
+          path: config/seen_papers.txt
+          if-no-files-found: warn
+          retention-days: 7
