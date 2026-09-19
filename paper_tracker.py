@@ -1,15 +1,42 @@
 import os
+import re
+import sys
+import time
 import requests
 from openai import OpenAI
 
 # --- 配置区 (这些将配置在 GitHub Secrets 中) ---
-S2_API_KEY = os.getenv("S2_API_KEY")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY")
+S2_API_KEY = (os.getenv("S2_API_KEY") or "").strip()
+LLM_API_KEY = (os.getenv("LLM_API_KEY") or "").strip()
+SERVERCHAN_KEY = (os.getenv("SERVERCHAN_KEY") or "").strip()
 
 HISTORY_FILE = "config/seen_papers.txt"
 BLACKLIST_FILE = "config/blacklisted_venues.txt"
 MAX_PAPERS_AQUIRED_FROM_S2 = 100
+
+
+def validate_config():
+    """只报告有问题的配置名称，不输出密钥。"""
+    for name, value in (
+        ("S2_API_KEY", S2_API_KEY),
+        ("LLM_API_KEY", LLM_API_KEY),
+        ("SERVERCHAN_KEY", SERVERCHAN_KEY),
+    ):
+        if not value:
+            raise ValueError(f"缺少 {name}：请在 Settings → Secrets and variables → Actions 中配置 repository secret。")
+        if not value.isascii() or any(char.isspace() or ord(char) < 33 or ord(char) == 127 for char in value):
+            raise ValueError(f"{name} 含非 ASCII 字符、空白或控制字符：请重新复制实际密钥，不要填写中文说明。")
+
+
+def safe_error(error):
+    """异常信息可能带请求 URL 或请求头；先遮盖密钥，再输出。"""
+    message = str(error)
+    for name in ("S2_API_KEY", "LLM_API_KEY", "SERVERCHAN_KEY"):
+        raw_value = os.getenv(name) or ""
+        for value in (raw_value, raw_value.strip()):
+            if value:
+                message = message.replace(value, "***")
+    return message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def read_list(file_path):
@@ -27,12 +54,21 @@ def read_seed_papers(file_path):
         print(f"Warning: 找不到文件 {file_path}")
         return papers
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
+    with open(file_path, "r", encoding="utf-8-sig") as f:
+        for line_number, line in enumerate(f, 1):
             # 移除换行符和首尾空格
             line = line.strip()
             # 忽略空行
-            if line:
+            if not line or line.startswith("#"):
+                continue
+            prefix, separator, identifier = line.partition(":")
+            supported = {"DOI", "ARXIV", "CORPUSID", "MAG", "ACL", "PMID", "PMCID", "URL"}
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", line):
+                if not separator or prefix.upper() not in supported or not identifier.strip():
+                    raise ValueError(f"{file_path} 第 {line_number} 行不是完整的论文 ID；不能只填写 DOI:。")
+                if prefix.upper() == "DOI" and not re.fullmatch(r"10\.\d{4,9}/\S+", identifier):
+                    raise ValueError(f"{file_path} 第 {line_number} 行的 DOI 格式不正确。")
+            if line not in papers:
                 papers.append(line)
     return papers
 
@@ -49,8 +85,7 @@ def get_paper_recommendations():
     print(f"载入负向论文: {len(negative_papers)} 篇")
 
     if not positive_papers:
-        print("错误：推荐系统至少需要一篇 Positive 论文作为基准。")
-        return []
+        raise ValueError("推荐系统至少需要一篇 Positive 论文作为基准。")
 
     payload = {"positivePaperIds": positive_papers, "negativePaperIds": negative_papers}
 
@@ -60,11 +95,14 @@ def get_paper_recommendations():
         "limit": MAX_PAPERS_AQUIRED_FROM_S2,
     }
 
-    response = requests.post(url, json=payload, headers=headers, params=params)
+    print("正在请求 Semantic Scholar 推荐接口...")
+    response = requests.post(url, json=payload, headers=headers, params=params, timeout=60)
 
     if response.status_code != 200:
-        print(f"API 请求失败: {response.status_code} - {response.text}")
-        return []
+        raise RuntimeError(
+            f"Semantic Scholar 推荐失败，HTTP {response.status_code}: {response.text}。"
+            "400/404 请核对种子 ID 及是否已被收录；401/403 请检查 S2_API_KEY；429 请稍后重试。"
+        )
 
     raw_papers = response.json().get("recommendedPapers", [])
     seen_papers = set(read_list(HISTORY_FILE))
@@ -113,9 +151,18 @@ def get_paper_recommendations():
         batch_url = "https://api.semanticscholar.org/graph/v1/paper/batch"
         batch_params = {"fields": "paperId,tldr"}
 
-        batch_res = requests.post(
-            batch_url, json={"ids": paper_ids}, headers=headers, params=batch_params
-        )
+        # 同一 API key 的请求之间留出间隔。
+        time.sleep(1.1)
+        try:
+            batch_res = requests.post(
+                batch_url, json={"ids": paper_ids}, headers=headers, params=batch_params,
+                timeout=60,
+            )
+        except requests.RequestException as error:
+            print(f"警告: TLDR 请求异常，继续使用摘要: {type(error).__name__}")
+            for p in top_new_papers:
+                p["tldrText"] = ""
+            return top_new_papers
 
         if batch_res.status_code == 200:
             tldr_data = batch_res.json()
@@ -131,7 +178,7 @@ def get_paper_recommendations():
             for p in top_new_papers:
                 p["tldrText"] = tldr_dict.get(p["paperId"], "")
         else:
-            print(f"警告: TLDR 批量请求失败: {batch_res.text}")
+            print(f"警告: TLDR 批量请求失败: HTTP {batch_res.status_code}，继续使用摘要。")
             for p in top_new_papers:
                 p["tldrText"] = ""
 
@@ -234,7 +281,8 @@ def push_to_wechat(content):
     requests.post(url, data=data)
 
 
-if __name__ == "__main__":
+def main():
+    validate_config()
     print("正在寻找最新推荐...")
     new_papers = get_paper_recommendations()
     if new_papers:
@@ -247,3 +295,11 @@ if __name__ == "__main__":
         print("全部完成！")
     else:
         print("今天没有发现未读的最新相关文献。")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"::error::{type(error).__name__}: {safe_error(error)}", file=sys.stderr)
+        sys.exit(1)
